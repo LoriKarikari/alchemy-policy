@@ -63,3 +63,22 @@ test.provider("clean stack passes", (scratch) =>
     expect(policies.assert(plan as any, { stage: "test" })).toHaveLength(0);
   }),
 );
+
+// ── Effect Layer packaging ──────────────────────────────────────────────────
+import { PolicyService, layer } from "../src/effect.ts";
+
+test.provider("PolicyService layer asserts inside an Effect program", (scratch) =>
+  Effect.gen(function* () {
+    const plan = yield* scratch.plan(
+      Effect.gen(function* () {
+        const weak = yield* Random("Weak", { bytes: 8 });
+        return { weak: weak.text };
+      }),
+    );
+    const svc = yield* yield* PolicyService;
+    const result = yield* svc
+      .assert(plan as any, { stage: "test" })
+      .pipe(Effect.flip);
+    expect(result.violations[0]!.policy).toBe("no-weak-secrets");
+  }).pipe(Effect.provide(layer(noWeakSecrets))),
+);
