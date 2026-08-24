@@ -37,6 +37,7 @@ test.provider("flags weak secrets in a real engine plan", (scratch) =>
 
     const violations = policies.evaluate(plan, { stage: "test" });
 
+    console.error(`[DEBUG-ci-violations] ${JSON.stringify(violations)}`);
     const errors = violations.filter((violation) => violation.severity === "error");
     expect(errors).toHaveLength(1);
     expect(errors[0]!.policy).toBe("noWeakSecrets");
