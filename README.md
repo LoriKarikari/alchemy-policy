@@ -1,41 +1,100 @@
 # alchemy-policy
 
-Policy-as-code for [Alchemy](https://alchemy.run) plans — OPA's job with Zod's ergonomics.
+Define policies for [Alchemy](https://alchemy.run) plans in TypeScript.
 
-Policies are typed TypeScript predicates over the plan. Select by resource
-constructor and the props are fully inferred; typo a property and it's a
-compile error, not a silently-passing policy.
+> This package is under development and is not published to npm yet.
+
+## Define policies
 
 ```ts
-import * as Policy from "alchemy-policy";
-import * as AWS from "alchemy/AWS";
+import * as Cloudflare from "alchemy/Cloudflare";
+import * as p from "alchemy-policy";
 
-const noPublicBuckets = Policy.forResource(AWS.S3.Bucket, "no-public-buckets")
-  .deny((b) => b.acl === "public-read" || b.acl === "public-read-write")
-  .message("S3 buckets must not be public");
+export const policies = p.define({
+  requireObservability: p.resource(Cloudflare.Worker).matches(
+    {
+      observability: {
+        enabled: true,
+        logs: { enabled: true },
+        traces: { enabled: true },
+      },
+    },
+    {
+      message: "Workers should enable logs and traces",
+      severity: "warn",
+    },
+  ),
 
-const noProdDeletes = Policy.forPlan("no-prod-deletes")
-  .when((ctx) => ctx.stage === "prod")
-  .deny((actions) => actions.some((a) => a.action === "delete"))
-  .message("refusing to delete resources in prod");
-
-const policies = Policy.set(noPublicBuckets, noProdDeletes);
-
-// Given a Plan (e.g. from alchemy's test harness scratch.plan(...)):
-policies.assert(plan, { stage: "prod" }); // throws PolicyViolationError
-policies.evaluate(plan, { stage: "dev" }); // -> Violation[]
+  protectProduction: p.plan().refine(
+    (plan, context) =>
+      context.stage !== "prod" ||
+      !plan.actions.some((action) => action.action === "delete"),
+    { message: "refusing to delete resources in prod" },
+  ),
+});
 ```
 
-- `.deny(pred)` / `.require(pred)` — violation when true / when false
-- `.severity("warn")` — advisory instead of blocking (default `"error"`)
-- `.message(string | (props, action) => string)` — per-rule message
-- `Policy.forPlan()` — rules over the flattened action list (creates,
-  replaces, deletes) for change-shaped policies, not just prop-shaped ones
+Resource patterns are partial and typed. Only include the properties the
+policy needs. Use `p.present`, `p.not()`, and `p.some()` for composed checks:
 
-Zero runtime dependency on alchemy: evaluation uses a structural view of the
-plan (`resources` / `deletions` nodes), so alchemy beta churn can't break it.
-Predicates that throw (e.g. on unresolved `Output` exprs) are reported as
-`warn` violations instead of crashing the run.
+```ts
+p.resource(Cloudflare.R2.Bucket).matches(
+  {
+    forceDestroy: p.not(true),
+    lifecycleRules: p.some({ deleteObjectsTransition: p.present }),
+  },
+  { message: "artifact buckets must retain their data" },
+);
+```
 
-Tests run real plans through alchemy's own engine via `alchemy/Test/Bun` and
-the credential-free `Alchemy.Random` resource: `bun test`.
+Use `.refine()` when a policy needs custom logic. Errors block by default; set
+`severity: "warn"` for advisory policies.
+
+## Check an Alchemy app
+
+Create a policy check script:
+
+```ts
+import { run } from "alchemy-policy/check";
+import app from "./alchemy.run.ts";
+import { policies } from "./policies.ts";
+
+await run(app, policies);
+```
+
+Run it with Bun:
+
+```sh
+ALCHEMY_STAGE=dev bun policy-check.ts
+```
+
+`run()` builds the plan, evaluates the policies, prints violations, and sets a
+failing exit code when it finds an error.
+
+## Use the result programmatically
+
+```ts
+import { check } from "alchemy-policy/check";
+
+const violations = yield* check(app, policies, { stage: "dev" });
+```
+
+If you already have an Alchemy plan:
+
+```ts
+const violations = policies.evaluate(plan, { stage: "dev" });
+yield* policies.assert(plan, { stage: "dev" });
+```
+
+`evaluate()` returns every warning and error. `assert()` fails with a tagged
+`PolicyViolationError` when an error is present.
+
+## Effect layer
+
+```ts
+import { layer } from "alchemy-policy/effect";
+
+const PolicyLayer = layer(policies);
+```
+
+Use this when the application needs the PolicySet in its Effect layer graph.

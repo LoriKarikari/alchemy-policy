@@ -1,12 +1,8 @@
-/**
- * alchemy-policy — policy-as-code for Alchemy plans, Zod-style.
- *
- * Zero runtime dependency on alchemy: policies evaluate a structural view
- * of the Plan (`resources` / `deletions` nodes), so this survives beta
- * churn in alchemy internals. Types are inferred from the resource
- * constructor's call signature: `Policy.for(AWS.S3.Bucket)` gives the
- * predicate fully-typed props.
- */
+import * as Effect from "effect/Effect";
+import { matches, type DeepPattern } from "./pattern.ts";
+
+export { not, present, some } from "./pattern.ts";
+export type { DeepPattern } from "./pattern.ts";
 
 export type Severity = "error" | "warn";
 
@@ -14,20 +10,15 @@ export interface Violation {
   policy: string;
   severity: Severity;
   message: string;
-  /** FQN of the offending resource; absent for plan-level policies. */
   fqn?: string;
-  /** Resource type token, e.g. "AWS.S3.Bucket". */
   type?: string;
 }
 
 export interface PolicyContext {
   stage?: string;
-  [key: string]: unknown;
 }
 
-// ── Structural view of an alchemy Plan ──────────────────────────────────────
-
-export type PlanActionKind = "create" | "update" | "replace" | "noop" | "delete";
+type PlanActionKind = "create" | "update" | "replace" | "noop" | "delete";
 
 interface ResourceRef {
   Type: string;
@@ -36,6 +27,7 @@ interface ResourceRef {
 interface ApplyNodeLike {
   action: "create" | "update" | "replace" | "noop";
   props?: any;
+  state?: { props?: any };
   resource: ResourceRef;
 }
 
@@ -49,7 +41,6 @@ export interface PlanLike {
   deletions: Record<string, DeleteNodeLike | undefined>;
 }
 
-/** One row of the flattened plan: what will happen to which resource. */
 export interface PlanAction {
   fqn: string;
   action: PlanActionKind;
@@ -57,190 +48,141 @@ export interface PlanAction {
   props?: any;
 }
 
-export const actionsOf = (plan: PlanLike): PlanAction[] => [
+export interface PlanView {
+  readonly actions: readonly PlanAction[];
+}
+
+export interface Diagnostic {
+  readonly message: string;
+  readonly severity?: Severity;
+}
+
+const actionsOf = (plan: PlanLike): PlanAction[] => [
   ...Object.entries(plan.resources).map(([fqn, node]) => ({
     fqn,
     action: node.action,
     type: node.resource.Type,
-    props: node.props,
+    props: node.props ?? node.state?.props,
   })),
   ...Object.entries(plan.deletions).flatMap(([fqn, node]) =>
     node ? [{ fqn, action: "delete" as const, type: node.resource.Type }] : [],
   ),
 ];
 
-// ── Policies ────────────────────────────────────────────────────────────────
+const violation = (
+  policy: string,
+  diagnostic: Diagnostic,
+  action?: PlanAction,
+): Violation => ({
+  policy,
+  severity: diagnostic.severity ?? "error",
+  message: diagnostic.message,
+  fqn: action?.fqn,
+  type: action?.type,
+});
 
-export interface Policy {
-  readonly name: string;
-  evaluate(plan: PlanLike, ctx: PolicyContext): Violation[];
-}
+type Declaration = (
+  name: string,
+  plan: PlanView,
+  context: PolicyContext,
+) => Violation[];
 
-/** Extract props from the constructor's phantom `Props` field. */
-type PropsOf<T> = T extends { Props: infer P } ? NonNullable<P> : any;
+type PropsOf<Tag> = Tag extends { Props: infer Props }
+  ? NonNullable<Props>
+  : never;
 
-interface Rule<P> {
-  deny: (props: P, action: PlanAction, ctx: PolicyContext) => boolean;
-  message?: string | ((props: P, action: PlanAction) => string);
-}
+type ResourceCheck<Props> = (
+  props: Props,
+  action: PlanAction,
+  context: PolicyContext,
+) => boolean;
 
-class ResourcePolicy<P> implements Policy {
-  #type: string;
-  #name: string;
+class ResourceBuilder<Props> {
+  constructor(readonly type: string) {}
 
-  get name() {
-    return this.#name;
-  }
-  #severity: Severity = "error";
-  #rules: Rule<P>[] = [];
-
-  constructor(type: string, name?: string) {
-    this.#type = type;
-    this.#name = name ?? `policy:${type}`;
-  }
-
-  /** Violation when the predicate is true. */
-  deny(pred: Rule<P>["deny"]): this {
-    this.#rules.push({ deny: pred });
-    return this;
-  }
-
-  /** Violation when the predicate is false. */
-  require(pred: Rule<P>["deny"]): this {
-    this.#rules.push({ deny: (p, a, c) => !pred(p, a, c) });
-    return this;
+  matches(
+    pattern: DeepPattern<Props>,
+    diagnostic: Diagnostic,
+  ): Declaration {
+    return this.refine((props) => matches(pattern, props), diagnostic);
   }
 
-  /** Message for the most recently added rule. */
-  message(msg: NonNullable<Rule<P>["message"]>): this {
-    const last = this.#rules.at(-1);
-    if (!last) throw new Error(".message() before any .deny()/.require()");
-    last.message = msg;
-    return this;
-  }
-
-  severity(s: Severity): this {
-    this.#severity = s;
-    return this;
-  }
-
-  named(name: string): this {
-    this.#name = name;
-    return this;
-  }
-
-  evaluate(plan: PlanLike, ctx: PolicyContext): Violation[] {
-    const violations: Violation[] = [];
-    for (const action of actionsOf(plan)) {
-      if (action.type !== this.#type || action.action === "delete") continue;
-      for (const rule of this.#rules) {
-        let hit: boolean;
+  refine(check: ResourceCheck<Props>, diagnostic: Diagnostic): Declaration {
+    return (name, plan, context) =>
+      plan.actions.flatMap((action) => {
+        if (action.type !== this.type || action.action === "delete") return [];
+        if (action.props === undefined) {
+          return [
+            violation(
+              name,
+              {
+                message:
+                  "policy could not evaluate unresolved resource properties",
+              },
+              action,
+            ),
+          ];
+        }
         try {
-          hit = rule.deny(action.props ?? ({} as P), action, ctx);
+          return check(action.props, action, context)
+            ? []
+            : [violation(name, diagnostic, action)];
         } catch (cause) {
-          violations.push({
-            policy: this.#name,
-            severity: "warn",
-            fqn: action.fqn,
-            type: action.type,
-            message: `policy failed to evaluate (unresolved props?): ${cause}`,
-          });
-          continue;
+          return [
+            violation(
+              name,
+              { message: `policy failed to evaluate: ${cause}` },
+              action,
+            ),
+          ];
         }
-        if (hit) {
-          violations.push({
-            policy: this.#name,
-            severity: this.#severity,
-            fqn: action.fqn,
-            type: action.type,
-            message:
-              typeof rule.message === "function"
-                ? rule.message(action.props, action)
-                : (rule.message ?? `${this.#name} violated`),
-          });
-        }
+      });
+  }
+}
+
+class PlanBuilder {
+  refine(
+    check: (plan: PlanView, context: PolicyContext) => boolean,
+    diagnostic: Diagnostic,
+  ): Declaration {
+    return (name, plan, context) => {
+      try {
+        return check(plan, context) ? [] : [violation(name, diagnostic)];
+      } catch (cause) {
+        return [
+          violation(name, { message: `policy failed to evaluate: ${cause}` }),
+        ];
       }
-    }
-    return violations;
+    };
   }
 }
 
-interface PlanRule {
-  deny: (actions: PlanAction[], ctx: PolicyContext) => boolean;
-  message?: string;
-}
+export const resource = <Tag extends ResourceRef>(tag: Tag) =>
+  new ResourceBuilder<PropsOf<Tag>>(tag.Type);
 
-class PlanPolicy implements Policy {
-  #name: string;
+export const plan = () => new PlanBuilder();
 
-  get name() {
-    return this.#name;
-  }
-  #severity: Severity = "error";
-  #when: (ctx: PolicyContext) => boolean = () => true;
-  #rules: PlanRule[] = [];
+const paint = (code: string, text: string) => `\x1b[${code}m${text}\x1b[0m`;
 
-  constructor(name = "policy:plan") {
-    this.#name = name;
-  }
-
-  when(pred: (ctx: PolicyContext) => boolean): this {
-    this.#when = pred;
-    return this;
-  }
-
-  deny(pred: PlanRule["deny"]): this {
-    this.#rules.push({ deny: pred });
-    return this;
-  }
-
-  message(msg: string): this {
-    const last = this.#rules.at(-1);
-    if (!last) throw new Error(".message() before any .deny()");
-    last.message = msg;
-    return this;
-  }
-
-  severity(s: Severity): this {
-    this.#severity = s;
-    return this;
-  }
-
-  named(name: string): this {
-    this.#name = name;
-    return this;
-  }
-
-  evaluate(plan: PlanLike, ctx: PolicyContext): Violation[] {
-    if (!this.#when(ctx)) return [];
-    const flat = actionsOf(plan);
-    return this.#rules
-      .filter((rule) => rule.deny(flat, ctx))
-      .map((rule) => ({
-        policy: this.#name,
-        severity: this.#severity,
-        message: rule.message ?? `${this.#name} violated`,
-      }));
-  }
-}
-
-// ── Entry points ────────────────────────────────────────────────────────────
-
-/** Per-resource-type policy. Pass the resource constructor for typed props. */
-export const forResource = <T extends ResourceRef>(
-  tag: T,
-  name?: string,
-): ResourcePolicy<PropsOf<T>> => new ResourcePolicy(tag.Type, name);
-
-/** Policy over the whole plan (actions, deletes, replaces). */
-export const forPlan = (name?: string): PlanPolicy => new PlanPolicy(name);
+export const formatViolations = (
+  violations: readonly Violation[],
+  options: { color?: boolean } = {},
+): string[] =>
+  violations.map((item) => {
+    const label = options.color
+      ? paint(item.severity === "error" ? "31" : "33", item.severity)
+      : item.severity;
+    return `${label} ${item.policy}${item.fqn ? ` @ ${item.fqn}` : ""}: ${item.message}`;
+  });
 
 export class PolicyViolationError extends Error {
+  readonly _tag = "PolicyViolationError";
+
   constructor(readonly violations: Violation[]) {
     super(
       `${violations.length} policy violation(s):\n` +
-        violations
-          .map((v) => `  [${v.severity}] ${v.policy}${v.fqn ? ` @ ${v.fqn}` : ""}: ${v.message}`)
+        formatViolations(violations)
+          .map((line) => `  ${line}`)
           .join("\n"),
     );
     this.name = "PolicyViolationError";
@@ -248,17 +190,32 @@ export class PolicyViolationError extends Error {
 }
 
 export interface PolicySet {
-  evaluate(plan: PlanLike, ctx?: PolicyContext): Violation[];
-  /** Throws PolicyViolationError if any error-severity violation exists. */
-  assert(plan: PlanLike, ctx?: PolicyContext): Violation[];
+  evaluate(plan: PlanLike, context?: PolicyContext): Violation[];
+  assert(
+    plan: PlanLike,
+    context?: PolicyContext,
+  ): Effect.Effect<Violation[], PolicyViolationError>;
 }
 
-export const set = (...policies: Policy[]): PolicySet => ({
-  evaluate: (plan, ctx = {}) => policies.flatMap((p) => p.evaluate(plan, ctx)),
-  assert(plan, ctx = {}) {
-    const violations = this.evaluate(plan, ctx);
-    const errors = violations.filter((v) => v.severity === "error");
-    if (errors.length > 0) throw new PolicyViolationError(errors);
-    return violations;
-  },
-});
+export const define = <const Definitions extends Record<string, Declaration>>(
+  definitions: Definitions,
+): PolicySet => {
+  const entries = Object.entries(definitions);
+  const evaluate = (plan: PlanLike, context: PolicyContext = {}) => {
+    const view = { actions: actionsOf(plan) } satisfies PlanView;
+    return entries.flatMap(([name, declaration]) =>
+      declaration(name, view, context),
+    );
+  };
+  return {
+    evaluate,
+    assert: (plan, context = {}) =>
+      Effect.suspend(() => {
+        const violations = evaluate(plan, context);
+        const errors = violations.filter((item) => item.severity === "error");
+        return errors.length > 0
+          ? Effect.fail(new PolicyViolationError(errors))
+          : Effect.succeed(violations);
+      }),
+  };
+};

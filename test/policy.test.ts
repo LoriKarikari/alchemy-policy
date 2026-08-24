@@ -2,25 +2,27 @@ import { expect } from "bun:test";
 import { Random, RandomProvider } from "alchemy/Random";
 import * as Test from "alchemy/Test/Bun";
 import * as Effect from "effect/Effect";
-import * as Policy from "../src/index.ts";
+import { PolicyService, layer } from "../src/effect.ts";
+import * as p from "../src/index.ts";
 
 const { test } = Test.make({ providers: RandomProvider() });
 
-const noWeakSecrets = Policy.forResource(Random, "no-weak-secrets")
-  .deny((props) => (props.bytes ?? 32) < 16)
-  .message((props) => `secret is ${props.bytes} bytes; minimum is 16`);
-
-const encourageExplicitBytes = Policy.forResource(Random, "explicit-bytes")
-  .require((props) => props.bytes !== undefined)
-  .message("prefer an explicit bytes value")
-  .severity("warn");
-
-const noDeletesInProd = Policy.forPlan("no-prod-deletes")
-  .when((ctx) => ctx.stage === "prod")
-  .deny((actions) => actions.some((a) => a.action === "delete"))
-  .message("refusing to delete resources in prod");
-
-const policies = Policy.set(noWeakSecrets, encourageExplicitBytes, noDeletesInProd);
+const policies = p.define({
+  noWeakSecrets: p.resource(Random).refine(
+    (props) => (props.bytes ?? 32) >= 16,
+    { message: "secret must contain at least 16 bytes" },
+  ),
+  explicitBytes: p.resource(Random).matches(
+    { bytes: p.present },
+    { message: "prefer an explicit bytes value", severity: "warn" },
+  ),
+  noProdDeletes: p.plan().refine(
+    (plan, context) =>
+      context.stage !== "prod" ||
+      !plan.actions.some((action) => action.action === "delete"),
+    { message: "refusing to delete resources in prod" },
+  ),
+});
 
 test.provider("flags weak secrets in a real engine plan", (scratch) =>
   Effect.gen(function* () {
@@ -33,22 +35,25 @@ test.provider("flags weak secrets in a real engine plan", (scratch) =>
       }),
     );
 
-    const violations = policies.evaluate(plan as any, { stage: "test" });
+    const violations = policies.evaluate(plan, { stage: "test" });
 
-    const errors = violations.filter((v) => v.severity === "error");
+    const errors = violations.filter((violation) => violation.severity === "error");
     expect(errors).toHaveLength(1);
-    expect(errors[0]!.policy).toBe("no-weak-secrets");
+    expect(errors[0]!.policy).toBe("noWeakSecrets");
     expect(errors[0]!.fqn).toContain("Weak");
-    expect(errors[0]!.message).toBe("secret is 8 bytes; minimum is 16");
+    expect(errors[0]!.message).toBe("secret must contain at least 16 bytes");
 
-    const warns = violations.filter((v) => v.severity === "warn");
-    expect(warns).toHaveLength(1);
-    expect(warns[0]!.policy).toBe("explicit-bytes");
-    expect(warns[0]!.fqn).toContain("Implicit");
-
-    expect(() => policies.assert(plan as any, { stage: "test" })).toThrow(
-      Policy.PolicyViolationError,
+    const warnings = violations.filter(
+      (violation) => violation.severity === "warn",
     );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]!.policy).toBe("explicitBytes");
+    expect(warnings[0]!.fqn).toContain("Implicit");
+
+    const failure = yield* policies.assert(plan, { stage: "test" }).pipe(
+      Effect.flip,
+    );
+    expect(failure).toBeInstanceOf(p.PolicyViolationError);
   }),
 );
 
@@ -60,12 +65,9 @@ test.provider("clean stack passes", (scratch) =>
         return { ok: ok.text };
       }),
     );
-    expect(policies.assert(plan as any, { stage: "test" })).toHaveLength(0);
+    expect(yield* policies.assert(plan, { stage: "test" })).toHaveLength(0);
   }),
 );
-
-// ── Effect Layer packaging ──────────────────────────────────────────────────
-import { PolicyService, layer } from "../src/effect.ts";
 
 test.provider("PolicyService layer asserts inside an Effect program", (scratch) =>
   Effect.gen(function* () {
@@ -75,10 +77,10 @@ test.provider("PolicyService layer asserts inside an Effect program", (scratch) 
         return { weak: weak.text };
       }),
     );
-    const svc = yield* yield* PolicyService;
-    const result = yield* svc
-      .assert(plan as any, { stage: "test" })
+    const service = yield* yield* PolicyService;
+    const failure = yield* service
+      .assert(plan, { stage: "test" })
       .pipe(Effect.flip);
-    expect(result.violations[0]!.policy).toBe("no-weak-secrets");
-  }).pipe(Effect.provide(layer(noWeakSecrets))),
+    expect(failure.violations[0]!.policy).toBe("noWeakSecrets");
+  }).pipe(Effect.provide(layer(policies))),
 );
