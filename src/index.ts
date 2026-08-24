@@ -62,7 +62,7 @@ const actionsOf = (plan: PlanLike): PlanAction[] => [
     fqn,
     action: node.action,
     type: node.resource.Type,
-    props: node.props ?? node.state?.props,
+    props: node.props ?? node.state?.props ?? {},
   })),
   ...Object.entries(plan.deletions).flatMap(([fqn, node]) =>
     node ? [{ fqn, action: "delete" as const, type: node.resource.Type }] : [],
