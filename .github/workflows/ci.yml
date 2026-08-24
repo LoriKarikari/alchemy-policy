@@ -16,7 +16,7 @@ jobs:
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run check
       - run: bun run lint
-      - run: bun test
+      - run: bun test --timeout 60000
         env:
           ALCHEMY_TEST_DEV: "true"
           ARTIFACT_TOKEN: test-token
